@@ -1,0 +1,400 @@
+volumes:
+  keycloak-postgres:
+  hivemq-data:
+  hivemq-config:
+  hivemq-extensions:
+  influxdb-data:
+  grafana_data:
+  mongo_data:
+  etc_wireguard:
+  certs:
+
+networks:
+  traefik-network:
+    external: true
+  db-network:
+    internal: true
+  mqtt-telegraf-network:
+    external: true
+  vpn-tunnel:
+    external: false
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${VPN_SUBNET}
+
+services:
+  traefik:
+    image: "traefik:3.0"
+    container_name: "traefik"
+    networks:
+      - traefik-network
+    env_file:
+      - path: .env
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - "./services/traefik/traefik-dynamic-config.yml:/etc/traefik/traefik-dynamic-config.yml"
+      - "/var/run/docker.sock:/var/run/docker.sock"
+      - certs:/etc/traefik/acme
+    command:
+      - "--log.level=error"
+      - "--accesslog=true"
+      - "--providers.docker=true"
+      - "--providers.docker.watch"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.endpoint=unix:///var/run/docker.sock"
+      - "--global.sendAnonymousUsage=false"
+      - "--providers.file.filename=/etc/traefik/traefik-dynamic-config.yml"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      - "--certificatesresolvers.${CERT_NAME}.acme.tlschallenge=true"
+      - "--certificatesresolvers.${CERT_NAME}.acme.email=${EMAIL}"
+      - "--certificatesresolvers.${CERT_NAME}.acme.storage=/etc/traefik/acme/acme.json"
+      - "--entrypoints.websecure.http.tls=true"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.traefik.rule=Host(`${SUBD_TRAEFIK}.${DOMAIN}`)"
+      - "traefik.http.routers.traefik.entrypoints=websecure"
+      - "traefik.http.routers.traefik.tls.certresolver=${CERT_NAME}"
+      - "traefik.http.services.traefik.loadbalancer.server.port=8080"
+
+  # WireGuard VPN. Secures the access to critical services, here the UI's of Keycloak, InfluxDB and HiveMQ
+  wg-easy:
+    image: "ghcr.io/wg-easy/wg-easy:14"
+    container_name: "wg-easy"
+    env_file:
+      - path: .env
+    environment:
+      - LANG=DE
+      - WG_HOST=${SUBD_WGEASY}.${DOMAIN}
+      - PASSWORD_HASH=${PASSWORD_HASH} # login does not work under chrome
+      - WG_ALLOWED_IPS=0.0.0.0/0, ::/0
+      - WG_PERSISTENT_KEEPALIVE=25
+      - WG_ENABLE_MASQUERADE=1
+      - WG_DEFAULT_DNS=8.8.8.8,8.8.4.4
+    ports:
+      - "51820:51820/udp"
+    networks:
+      traefik-network:
+      vpn-tunnel:
+        ipv4_address: ${IPV4_WG_EASY}
+    volumes:
+      - etc_wireguard:/etc/wireguard
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    restart: unless-stopped
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv4.conf.all.src_valid_mark=1
+      - net.ipv6.conf.all.disable_ipv6=1
+      #- net.ipv6.conf.all.forwarding=1
+      #- net.ipv6.conf.default.forwarding=1
+      - net.ipv4.conf.all.accept_source_route=1
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.wg-easy.rule=Host(`${SUBD_WGEASY}.${DOMAIN}`)"
+      - "traefik.http.routers.wg-easy.entrypoints=websecure"
+      - "traefik.http.routers.wg-easy.tls.certresolver=${CERT_NAME}"
+      - "traefik.http.services.wg-easy.loadbalancer.server.port=51821"
+      - "traefik.docker.network=traefik-network"
+      - "traefik.http.routers.wg-easy.tls=true"
+      - "traefik.http.routers.wg-easy.middlewares=rateLimit@file,whitelist@file"
+
+  # Identity and Access Management
+  keycloak:
+    image: bitnami/keycloak:24.0.3
+    container_name: keycloak
+    env_file:
+      - path: .env
+    environment:
+      QUARKUS_TRANSACTION_MANAGER_ENABLE_RECOVERY: true
+      ROOT_LOG_LEVEL: ERROR
+      KEYCLOAK_DATABASE_VENDOR: postgresql
+      KEYCLOAK_DATABASE_HOST: postgres
+      KEYCLOAK_DATABASE_PORT: 5432
+      KEYCLOAK_DATABASE_NAME: keycloak
+      KEYCLOAK_DATABASE_USER: ${GENERIC_USER}
+      KEYCLOAK_DATABASE_PASSWORD: ${GENERIC_PASSWORD}
+      KEYCLOAK_ADMIN_USER: ${GENERIC_USER}
+      KEYCLOAK_ADMIN_PASSWORD: ${GENERIC_PASSWORD}
+      KC_HOSTNAME: ${SUBD_KEYCLOAK}.${DOMAIN}
+      KC_HOSTNAME_PORT: ${PORT_KEYCLOAK}
+      KC_HTTP_PORT: ${PORT_KEYCLOAK}
+      KC_PROXY: edge
+      KEYCLOAK_EXTRA_ARGS: --import-realm
+    depends_on:
+      - postgres
+    volumes:
+      - ./services/keycloak/realms:/opt/bitnami/keycloak/data/import
+    labels:
+      # Allgemeine Konfiguration
+      - "traefik.enable=true"
+      - "traefik.docker.network=traefik-network"
+      - "traefik.http.services.keycloak.loadbalancer.server.port=${PORT_KEYCLOAK}"
+      - "traefik.http.services.keycloak.loadbalancer.passhostheader=true"
+
+      # Route for default user login access (whithout WhiteList)
+      - "traefik.http.routers.keycloak.rule=Host(`${SUBD_KEYCLOAK}.${DOMAIN}`) && !PathPrefix(`/admin`)"
+      - "traefik.http.routers.keycloak.entrypoints=websecure"
+      - "traefik.http.routers.keycloak.service=keycloak"
+      - "traefik.http.routers.keycloak.tls=true"
+      - "traefik.http.routers.keycloak.tls.certresolver=${CERT_NAME}"
+      - "traefik.http.routers.keycloak.middlewares=rateLimit@file"
+
+      # Route for Admin-UI (with Whitelist)
+      - "traefik.http.routers.keycloak-admin.rule=Host(`${SUBD_KEYCLOAK}.${DOMAIN}`) && PathPrefix(`/admin`)"
+      - "traefik.http.routers.keycloak-admin.entrypoints=websecure"
+      - "traefik.http.routers.keycloak-admin.service=keycloak"
+      - "traefik.http.routers.keycloak-admin.tls=true"
+      - "traefik.http.routers.keycloak-admin.tls.certresolver=${CERT_NAME}"
+      - "traefik.http.routers.keycloak-admin.middlewares=rateLimit@file,whitelist@file"
+    restart: unless-stopped
+    networks:
+      traefik-network:
+      db-network:
+      vpn-tunnel:
+        ipv4_address: ${IPV4_KEYCLOAK}
+
+  # PostgreSQL for Keycloak
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    env_file:
+      - path: .env
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: ${GENERIC_USER}
+      POSTGRES_PASSWORD: ${GENERIC_PASSWORD}
+    volumes:
+      - keycloak-postgres:/var/lib/postgresql/data
+    restart: unless-stopped
+    networks:
+      - db-network
+    healthcheck:
+      test:
+        ["CMD", "pg_isready", "-q", "-d", "keycloak", "-U", "${GENERIC_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  # Dashboard
+  grafana:
+    image: grafana/grafana:latest
+    env_file:
+      - path: .env
+    container_name: grafana
+    #depends_on:
+    #  - keycloak
+    restart: unless-stopped
+    user: "root"
+    environment:
+      GF_LOG_LEVEL: "warning"
+      GF_SERVER_ROOT_URL: "https://${SUBD_GRAFANA}.${DOMAIN}"
+      GF_SECURITY_ADMIN_USER: ${GENERIC_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GENERIC_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP: false
+      GF_AUTH_DISABLE_LOGIN_FORM: true
+      GF_SECURITY_ALLOW_EMBEDDING: true
+      GF_AUTO_SIGN_UP: true
+      GF_AUTH_GENERIC_OAUTH_AUTO_LOGIN: true
+      GF_SECURITY_OAUTH_LOGIN: true
+      GF_AUTH_DISABLE_SIGNOUT_MENU: true # id_token_hint error when signing out if false
+      GF_AUTH_ANONYMOUS_ENABLED: false
+      # We use Keycloak as the auth provider
+      GF_AUTH_GENERIC_OAUTH_EMAIL_ATTRIBUTE_PATH: email
+      GF_AUTH_GENERIC_OAUTH_LOGIN_ATTRIBUTE_PATH: username
+      GF_AUTH_GENERIC_OAUTH_NAME_ATTRIBUTE_PATH: "full_name"
+      GF_AUTH_GENERIC_OAUTH_ENABLED: true
+      GF_AUTH_GENERIC_OAUTH_NAME: ${KEYCLOAK_PROXY_PROVIDER}
+      GF_AUTH_GENERIC_OAUTH_ALLOW_SIGN_UP: true
+      GF_AUTH_GENERIC_OAUTH_CLIENT_ID: "${KEYCLOAK_PROXY_CLIENT_ID}"
+      GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET: "${KEYCLOAK_PROXY_CLIENT_SECRET}"
+      GF_AUTH_GENERIC_OAUTH_SCOPES: "openid email profile offline_access roles"
+      GF_AUTH_GENERIC_OAUTH_AUTH_URL: "https://${SUBD_KEYCLOAK}.${DOMAIN}/realms/${REALM_NAME}/protocol/openid-connect/auth"
+      GF_AUTH_GENERIC_OAUTH_TOKEN_URL: "https://${SUBD_KEYCLOAK}.${DOMAIN}/realms/${REALM_NAME}/protocol/openid-connect/token"
+      GF_AUTH_GENERIC_OAUTH_API_URL: "https://${SUBD_KEYCLOAK}.${DOMAIN}/realms/${REALM_NAME}/protocol/openid-connect/userinfo"
+      GF_AUTH_GENERIC_OAUTH_ROLE_ATTRIBUTE_PATH: contains(roles[*], 'grafanaadmin') && 'GrafanaAdmin' || contains(roles[*], 'admin') && 'Admin' || contains(roles[*], 'editor') && 'Editor' || 'Viewer'
+      GF_AUTH_GENERIC_OAUTH_ALLOW_ASSIGN_GRAFANA_ADMIN: "true"
+      GF_AUTH_GENERIC_GROUPS_ATTRIBUTE_PATH: "groups"
+      GF_AUTH_GENERIC_OAUTH_SIGNOUT_REDIRECT_URL: "https://${SUBD_KEYCLOAK}.${DOMAIN}/realms/${REALM_NAME}/protocol/openid-connect/logout?post_logout_redirect_uri=https%3A%2F%2F${SUBD_GRAFANA}.${DOMAIN}%2Flogin"
+      GF_AUTH_GENERIC_OAUTH_USE_REFRESH_TOKEN: "true"
+      GF_HTTP_ACCESS_CONTROL_ALLOW_METHODS: "GET,POST,PUT,DELETE"
+      GF_HTTP_ACCESS_CONTROL_ALLOW_HEADERS: "Origin, X-Requested-With, Content-Type, Accept, Authorization"
+      # Necessary for the datesource.yml under provisioning
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./services/grafana/provisioning:/etc/grafana/provisioning
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.grafana.rule=Host(`${SUBD_GRAFANA}.${DOMAIN}`)"
+      - "traefik.http.routers.grafana.entrypoints=websecure"
+      - "traefik.http.services.grafana.loadbalancer.server.port=3000"
+      - "traefik.http.routers.grafana.service=grafana"
+      - "traefik.http.routers.grafana.tls=true"
+      - "traefik.docker.network=traefik-network"
+      - "traefik.http.routers.grafana.tls.certresolver=${CERT_NAME}"
+      - "traefik.http.services.grafana.loadbalancer.passhostheader=true"
+      - "traefik.http.routers.grafana.middlewares=whitelist@file"
+    networks:
+      traefik-network: # Allow grafana to be accessed from the public internet
+      vpn-tunnel: # Allow grafana to access the services behind the vpn
+        ipv4_address: ${IPV4_GRAFANA}
+      db-network:
+
+  # MQTT Broker
+  hivemq:
+    image: hivemq/hivemq4
+    container_name: hivemq
+    env_file:
+      - path: .env
+    volumes:
+      - ./services/hivemq/hivemq-extensions:/opt/hivemq/extensions
+      - ./services/hivemq/hivemq-config:/opt/hivemq/conf
+      #- hivemq-data:/opt/hivemq/data
+    expose:
+      - "1883"
+      - "8883"
+      - "9001"
+    #ports:
+    #  - "8080:8080"  # Web UI
+    networks:
+      traefik-network:
+      vpn-tunnel:
+        ipv4_address: ${IPV4_HIVEMQ}
+      mqtt-telegraf-network:
+        aliases:
+          - ${HIVEMQ_NETWORK_ALIAS} # only for internal docker access
+    restart: unless-stopped
+    labels:
+      - "traefik.enable=true"
+
+      ########################
+      # We don't need this, because the Ports 1883, 8883 and 9001 are only accessible via the VPN
+      # mqtt://10.13.13.5:1883
+      # Uncomment if you want to use the MQTT broker over the public internet
+      ########################
+
+      #  # MQTT Configuration
+      #  - "traefik.tcp.routers.hivemq-mqtt.rule=HostSNI(`${SUBD_HIVEMQ}.${DOMAIN}`)"
+      #  - "traefik.tcp.routers.hivemq-mqtt.entrypoints=mqtt"
+      #  - "traefik.tcp.routers.hivemq-mqtt.tls.certresolver=${CERT_NAME}""
+      #  - "traefik.tcp.routers.hivemq-mqtt.service=hivemq-mqtt-service"
+      #  - "traefik.tcp.services.hivemq-mqtt-service.loadbalancer.server.port=1883"
+      #  - "traefik.tcp.routers.hivemq-mqtt.tls=true"
+      #  - "traefik.docker.network=traefik-network"
+
+      # MQTT8883 Configuration
+      #  - "traefik.tcp.routers.hivemq-mqtt8.rule=HostSNI(`${SUBD_HIVEMQ}.${DOMAIN}`)"
+      #  - "traefik.tcp.routers.hivemq-mqtt8.entrypoints=mqtt"
+      #  - "traefik.tcp.routers.hivemq-mqtt8.tls.certresolver=${CERT_NAME}""
+      #  - "traefik.tcp.routers.hivemq-mqtt8.service=hivemq-mqtt8-service"
+      #  - "traefik.tcp.services.hivemq-mqtt8-service.loadbalancer.server.port=8883"
+      #  - "traefik.tcp.routg-easyers.hivemq-mqtt8.tls=true"
+      #  - "traefik.docker.network=traefik-network"
+
+      # WebSocket Configuration
+      #  - "traefik.http.routers.hivemq-websocket.rule=Host(`${SUBD_HIVEMQ}.${DOMAIN}`)"
+      #  - "traefik.http.routers.hivemq-websocket.entrypoints=websecure"
+      #  - "traefik.http.routers.hivemq-websocket.tls.certresolver=${CERT_NAME}""
+      #  - "traefik.http.routers.hivemq-websocket.service=hivemq-websocket-service"
+      #  - "traefik.http.services.hivemq-websocket-service.loadbalancer.server.port=9001"
+      #  - "traefik.http.routers.hivemq-websocket.tls=true"
+      #  - "traefik.docker.network=traefik-network"
+
+      # You can also use the following labels to configure the HiveMQ dashboard:
+      # Dashboard Configuration
+      - "traefik.http.routers.hivemq-dashboard.rule=Host(`${SUBD_HIVEMQ}.${DOMAIN}`)"
+      - "traefik.http.routers.hivemq-dashboard.entrypoints=websecure"
+      - "traefik.http.routers.hivemq-dashboard.tls.certresolver=${CERT_NAME}"
+      - "traefik.http.routers.hivemq-dashboard.service=hivemq-dashboard-service"
+      - "traefik.http.services.hivemq-dashboard-service.loadbalancer.server.port=8080"
+      - "traefik.http.routers.hivemq-dashboard.tls=true"
+      - "traefik.docker.network=traefik-network"
+      - "traefik.http.routers.hivemq-dashboard.middlewares=rateLimit@file,whitelist@file"
+
+  # Time Series Database
+  influxdb:
+    image: influxdb:2.7.11
+    container_name: ${CONTAINER_INFLUXDB}
+    env_file:
+      - path: .env
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: ${GENERIC_USER}
+      DOCKER_INFLUXDB_INIT_PASSWORD: ${GENERIC_PASSWORD}
+      DOCKER_INFLUXDB_INIT_ORG: ${DOCKER_INFLUXDB_INIT_ORG}
+      DOCKER_INFLUXDB_INIT_BUCKET: ${DOCKER_INFLUXDB_INIT_BUCKET}
+      DOCKER_INFLUXDB_INIT_RETENTION: 365d
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${DOCKER_INFLUXDB_INIT_ADMIN_TOKEN}
+      IPV4_INFLUX: ${IPV4_INFLUX}
+    volumes:
+      - influxdb-data:/var/lib/influxdb
+    expose:
+      - ${PORT_INFLUXDB}
+    networks:
+      db-network:
+      vpn-tunnel:
+        ipv4_address: ${IPV4_INFLUX} # Only accessible over the VPN
+    restart: unless-stopped
+
+  # MQTT-Client, collects metrics from the MQTT broker and writes them into InfluxDB
+  telegraf:
+    image: telegraf
+    container_name: telegraf
+    depends_on:
+      - influxdb
+    user: "root"
+    env_file:
+      - path: .env
+    environment:
+      HOST_ETC: /hostfs/etc
+      HOST_PROC: /hostfs/proc
+      HOST_SYS: /hostfs/sys
+      HOST_VAR: /hostfs/var
+      HOST_RUN: /hostfs/run
+      HOST_MOUNT_PREFIX: /hostfs
+      # InfluxDB output
+      DOCKER_INFLUXDB_INIT_URL: http://${IPV4_INFLUX}:${PORT_INFLUXDB}
+      DOCKER_INFLUXDB_INIT_ORG: ${DOCKER_INFLUXDB_INIT_ORG}
+      DOCKER_INFLUXDB_INIT_BUCKET: ${DOCKER_INFLUXDB_INIT_BUCKET}
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${DOCKER_INFLUXDB_INIT_ADMIN_TOKEN}
+      # MQTT input
+      DOMAIN_MQTT: ${IPV4_HIVEMQ}
+      MQTT_PORT: 1883
+      MQTT_USER: ${MQTT_USER}
+      MQTT_PASSWORD: ${MQTT_PASSWORD}
+      MQTT_DOCKER_SERVER_FOR_TELEGRAF: ${HIVEMQ_NETWORK_ALIAS}
+      TOPICS: ${TOPICS}
+      TELEGRAF_QOS: ${TELEGRAF_QOS}
+      TELEGRAF_CLIENT_ID: ${TELEGRAF_CLIENT_ID}
+      DATA_FORMAT: ${DATA_FORMAT}
+      DATA_TYPE: ${DATA_TYPE}
+      TOPIC: ${TOPIC}
+      MEASUREMENT: ${MEASUREMENT}
+      TAGS: ${TAGS}
+      FIELDS: ${FIELDS}
+      TAG_KEY: ${TAG_KEY}
+      VALUE_KEY: ${VALUE_KEY}
+      INSECURE_SKIP_VERIFY: ${INSECURE_SKIP_VERIFY}
+      IPV4_TELEGRAF: ${IPV4_TELEGRAF}
+    volumes:
+      - ./services/telegraf/telegraf.conf:/etc/telegraf/telegraf.conf
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /:/hostfs:ro
+    links:
+      - influxdb
+    networks:
+      traefik-network:
+      vpn-tunnel:
+        ipv4_address: ${IPV4_TELEGRAF}
+      mqtt-telegraf-network:
+        aliases:
+          - telegraf
+    restart: unless-stopped

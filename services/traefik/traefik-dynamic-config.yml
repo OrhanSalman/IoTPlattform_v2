@@ -1,0 +1,16 @@
+http:
+  middlewares:
+    whitelist:
+      ipWhiteList:
+        sourceRange:
+          - "192.168.1.0/24"
+          - "10.8.0.0/24"
+          - "{{ env `VPN_SUBNET` }}"
+          - "127.0.0.1/32"
+          - "172.16.0.1/12" # Docker Gateway IP, if using treafik and wireguard in the same network
+          - "{{ env `ALLOWED_IP` }}" # your ip for initial setup delivery
+    rateLimit:
+      rateLimit:
+        average: 200
+        burst: 100
+        period: "10s"

@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<hivemq>
+    <listeners>
+        <tcp-listener>
+            <port>1883</port>
+            <bind-address>0.0.0.0</bind-address>
+        </tcp-listener>
+        <tcp-listener>
+            <port>8883</port>
+            <bind-address>0.0.0.0</bind-address>
+        </tcp-listener>
+        <websocket-listener>
+            <port>9001</port>
+            <bind-address>0.0.0.0</bind-address>
+        </websocket-listener>
+    </listeners>
+
+    <control-center>
+        <enabled>true</enabled>
+        <listeners>
+            <http>
+                <port>8080</port>
+                <bind-address>0.0.0.0</bind-address>
+            </http>
+        </listeners>
+        <users>
+            <user>
+                <name>admin</name>
+                <password>248466afb1c4a411ec1094abc458545f9c1e4be5c2dcf05db3f282f70214e1d5</password>
+            </user>
+        </users>
+    </control-center>
+</hivemq>
